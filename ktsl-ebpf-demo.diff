@@ -1,0 +1,217 @@
+diff --git a/examples/c/Makefile b/examples/c/Makefile
+index 6a82f26..331aef8 100644
+--- a/examples/c/Makefile
++++ b/examples/c/Makefile
+@@ -25,7 +25,7 @@ CFLAGS := -g -Wall
+ ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
+ 
+ APPS = minimal minimal_legacy minimal_ns bootstrap uprobe kprobe fentry \
+-       usdt sockfilter tc ksyscall task_iter lsm
++       usdt sockfilter tc ksyscall task_iter lsm sk_msg
+ 
+ CARGO ?= $(shell which cargo)
+ ifeq ($(strip $(CARGO)),)
+diff --git a/examples/c/sk_msg.bpf.c b/examples/c/sk_msg.bpf.c
+new file mode 100644
+index 0000000..b5e5c09
+--- /dev/null
++++ b/examples/c/sk_msg.bpf.c
+@@ -0,0 +1,78 @@
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_core_read.h>
++#include <bpf/bpf_endian.h>
++
++#include "sk_msg.h"
++
++char LICENSE[] SEC("license") = "Dual BSD/GPL";
++
++//////////////////
++
++#define LOCALHOST_IPV4 16777343
++
++struct sock_key {
++	__u32 sip;
++	__u32 dip;
++	__u32 sport;
++	__u32 dport;
++	__u32 family;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_SOCKHASH);
++	__uint(max_entries, 65535);
++	__type(key, struct sock_key);
++	__type(value, int);
++} sock_ops_map SEC(".maps");
++
++/////////////////////////
++
++SEC("sockops")
++int bpf_sockops(struct bpf_sock_ops *skops)
++{
++	u32 family, op;
++
++	family = skops->family;
++	op = skops->op;
++	if (op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB && op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB) {
++		return BPF_OK;
++	}
++
++	if (skops->remote_ip4 != LOCALHOST_IPV4 || skops->local_ip4 != LOCALHOST_IPV4) {
++		return BPF_OK;
++	}
++
++	struct sock_key key = {
++		.dip = skops->remote_ip4,
++		.sip = skops->local_ip4,
++		.sport = bpf_htonl(skops->local_port), /* convert to network byte order */
++		.dport = skops->remote_port,
++		.family = skops->family,
++	};
++
++	bpf_printk(">>> new connection: OP:%d, PORT:%d --> %d\n", op, bpf_ntohl(key.sport),
++		   bpf_ntohl(key.dport));
++
++	bpf_sock_hash_update(skops, &sock_ops_map, &key, BPF_NOEXIST);
++	return BPF_OK;
++}
++
++/////////
++
++SEC("sk_msg")
++int bpf_sk_msg(struct sk_msg_md *msg)
++{
++	if (msg->remote_ip4 != LOCALHOST_IPV4 || msg->local_ip4 != LOCALHOST_IPV4)
++		return SK_PASS;
++
++	bpf_printk(">>> sk_msg: %d bytes from %d:%d to %d:%d\n", msg->size,
++		   bpf_ntohl(msg->remote_ip4), msg->remote_port, bpf_ntohl(msg->local_ip4),
++		   msg->local_port);
++
++	bpf_msg_pull_data(msg, 0, msg->size, 0);
++	bpf_printk(">>> sk_msg: %s\n", (char *)msg->data);
++
++	return SK_PASS;
++}
+\ No newline at end of file
+diff --git a/examples/c/sk_msg.c b/examples/c/sk_msg.c
+new file mode 100644
+index 0000000..dd1c80d
+--- /dev/null
++++ b/examples/c/sk_msg.c
+@@ -0,0 +1,83 @@
++
++#include <argp.h>
++#include <signal.h>
++#include <stdio.h>
++#include <time.h>
++#include <sys/resource.h>
++#include <bpf/libbpf.h>
++#include <fcntl.h>
++
++#include "sk_msg.h"
++#include "sk_msg.skel.h"
++
++static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
++{
++	return vfprintf(stderr, format, args);
++}
++
++int main(int argc, char **argv)
++{
++	struct sk_msg_bpf *skel;
++	int err;
++
++	/* Set up libbpf errors and debug info callback */
++	libbpf_set_print(libbpf_print_fn);
++
++	/* Load and verify BPF application */
++	skel = sk_msg_bpf__open();
++	if (!skel) {
++		fprintf(stderr, "Failed to open and load BPF skeleton\n");
++		return 1;
++	}
++
++	/* Load & verify BPF programs */
++	err = sk_msg_bpf__load(skel);
++	if (err) {
++		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
++		goto cleanup;
++	}
++
++	/* attach cgroup */
++	int cg_fd = open("/sys/fs/cgroup/", __O_DIRECTORY, O_RDONLY);
++	if (cg_fd < 0) {
++		fprintf(stderr, "failed to open cgroup, err: %d: %s", errno, strerror(errno));
++		exit(1);
++	}
++	err = bpf_prog_attach(bpf_program__fd(skel->progs.bpf_sockops), cg_fd, BPF_CGROUP_SOCK_OPS,
++			      0);
++	if (err < 0) {
++		fprintf(stderr, "Failed to attach cgroup, err: %d: %s", errno, strerror(errno));
++		exit(1);
++	}
++
++	/* attach sock map */
++	skel->links.bpf_sk_msg = bpf_program__attach_sockmap(skel->progs.bpf_sk_msg,
++							     bpf_map__fd(skel->maps.sock_ops_map));
++	if (!skel->links.bpf_sk_msg) {
++		fprintf(stderr,
++			"Failed to attach sockmap (%i->%i), err: %d: (%s)\n",
++			bpf_program__fd(skel->progs.bpf_sk_msg),
++			bpf_map__fd(skel->maps.sock_ops_map), errno, strerror(errno));
++		return -1;
++	}
++
++	/* Attach tracepoints */
++	err = sk_msg_bpf__attach(skel);
++	if (err) {
++		fprintf(stderr, "Failed to attach BPF skeleton, err: %d: %s\n",
++		errno, strerror(errno));
++		goto cleanup;
++	}
++
++	/* Start the event loop */
++	printf("Listening for socket messages...\n");
++	while (1) {
++		fprintf(stderr, ".");
++		sleep(1);
++	}
++
++cleanup:
++	// ring_buffer__free(rb);
++	sk_msg_bpf__destroy(skel);
++	return err < 0 ? -err : 0;
++}
+\ No newline at end of file
+diff --git a/examples/c/sk_msg.h b/examples/c/sk_msg.h
+new file mode 100644
+index 0000000..e342120
+--- /dev/null
++++ b/examples/c/sk_msg.h
+@@ -0,0 +1,7 @@
++#ifndef __SK_MSG_H
++#define __SK_MSG_H
++
++
++
++
++#endif /* __SK_MSG_H */
+diff --git a/examples/c/xmake.lua b/examples/c/xmake.lua
+index c4a5f3d..500d180 100644
+--- a/examples/c/xmake.lua
++++ b/examples/c/xmake.lua
+@@ -124,3 +124,11 @@ target("kprobe")
+         -- TODO we need fix vmlinux.h to support android
+         set_default(false)
+     end
++
++target("sk_msg")
++    set_kind("binary")
++    add_files("sk_msg.c", "sk_msg.bpf.c")
++    add_packages("linux-headers")
++    if not has_config("system-libbpf") then
++        add_deps("libbpf")
++    end
